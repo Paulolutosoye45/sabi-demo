@@ -1,0 +1,12 @@
+# ── Environment Files (NEVER commit these) ───────────────────
+.env
+.env.local
+.env.production
+.env.development
+wire_UP.md
+
+# ── Node ─────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

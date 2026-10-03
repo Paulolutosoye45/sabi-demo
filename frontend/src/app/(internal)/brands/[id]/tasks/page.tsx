@@ -1,0 +1,1029 @@
+'use client';
+
+import { useState, useEffect } from 'react';
+import { useParams, useRouter } from 'next/navigation';
+import Link from 'next/link';
+import toast from 'react-hot-toast';
+import {
+  Plus, X, Loader2, Check, ArrowLeft, AlertCircle,
+  Clock, User, Target, Lightbulb, MessageSquare,
+  Filter, LayoutGrid, List, ChevronRight,
+  FileSpreadsheet,
+  Sheet,
+  Pencil,
+  Trash2,
+  LoaderCircle
+} from 'lucide-react';
+
+import { useAgencyStore } from '@/lib/store';
+import { goals as goalsApi, strategies as stratApi } from '@/lib/api';
+import { useBrandPermissions } from '@/lib/permissions';
+import { AgencyTopNav } from '@/components/internal/AgencyTopNav';
+import { LoadingPage, EmptyState, Badge } from '@/components/ui';
+import Router from 'next/router';
+import Image from 'next/image';
+import ImportTasksModal from '@/components/ImportTasksModal';
+import ExcelIcon from '@/components/ExcelIcon';
+import { TaskGroupedView } from '@/components/tasks/TaskGroupedView';
+import { TaskDateFilter, DateFilter } from '@/components/tasks/TaskDateFilter';
+import { TaskCommentThread } from '@/components/tasks/TaskCommentThread';
+
+const tok = () => typeof window !== 'undefined' ? localStorage.getItem('sabi_token') : null;
+const api = (p: string, opts?: RequestInit) =>
+  fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'}${p}`, {
+    ...opts, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok()}`, ...(opts?.headers ?? {}) },
+  }).then(async r => { const b = await r.json(); if (!r.ok) throw new Error(b.error || b.message); return b; });
+
+const COLUMNS = [
+  { key: 'todo', label: 'To Do', color: 'border-white/10 bg-white/2', dot: 'bg-white/20' },
+  { key: 'in_progress', label: 'In Progress', color: 'border-blue-500/20 bg-blue-500/3', dot: 'bg-blue-500' },
+  { key: 'in_review', label: 'In Review', color: 'border-amber-500/20 bg-amber-500/3', dot: 'bg-amber-500' },
+  { key: 'done', label: 'Done', color: 'border-green-500/20 bg-green-500/3', dot: 'bg-green-500' },
+  { key: 'blocked', label: 'Blocked', color: 'border-red-500/20 bg-red-500/3', dot: 'bg-red-500' },
+  { key: 'verified', label: 'Verified', color: 'border-purple-500/20 bg-purple-500/3', dot: 'bg-purple-500' },
+  { key: 'pending_deletion', label: 'Pending Deletion', color: 'border-orange-500/20 bg-orange-500/3', dot: 'bg-orange-500' },
+];
+
+const PRIORITY_META: Record<string, { label: string; color: string; dot: string }> = {
+  low: { label: 'Low', color: 'text-white/30', dot: 'bg-white/20' },
+  medium: { label: 'Medium', color: 'text-blue-400', dot: 'bg-blue-400' },
+  high: { label: 'High', color: 'text-amber-400', dot: 'bg-amber-500' },
+  urgent: { label: 'Urgent', color: 'text-red-400', dot: 'bg-red-500' },
+};
+
+interface ITT {
+  id: string;
+  title: string,
+  description: string,
+  status: string,
+  priority: string,
+  due_date: string,
+  assignee_id: string,
+  strategy_id: string,
+  goal_id: string,
+  actual_hours: string,
+  estimated_hours: string,
+  tags: string[],
+  proof_links: string[],
+}
+
+const EMPTY_FORM = { title: '', description: '', priority: 'medium', due_date: '', assignee_id: '', strategy_id: '', goal_id: '', estimated_hours: '' };
+
+export default function BrandTasksPage() {
+  const { id: brandId } = useParams<{ id: string }>();
+  const { user } = useAgencyStore();
+  const perms = useBrandPermissions(brandId);
+
+  const [tasks, setTasks] = useState<any[]>([]);
+  const [teamMembers, setTeam] = useState<any[]>([]);
+  const [strategies, setStrats] = useState<any[]>([]);
+  const [goals, setGoals] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [view, setView] = useState<'kanban' | 'list'>('kanban');
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({ ...EMPTY_FORM });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [filterAssignee, setFA] = useState('');
+  const [dragging, setDragging] = useState<string | null>(null);
+  const [generatingTasks, setGeneratingTasks] = useState(false);
+  const [rejectingId, setRejectingId] = useState<string | null>(null);
+  const [rejectReason, setRejectReason] = useState('');
+  const [importOpen, setImportOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<ITT | null>(null); // holds the task being edited, null = modal closed
+  const [editForm, setEditForm] = useState({
+    title: '',
+    description: '',
+    status: 'todo',
+    priority: 'medium',
+    due_date: '',
+    assignee_id: '',
+    strategy_id: '',
+    goal_id: '',
+    actual_hours: '',
+    estimated_hours: '',
+    tags: '' as string,
+    proof_links: '' as string,
+  });
+  const [updateSaving, setUpdateSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [verifyTasking, setVerifyTasking] = useState<boolean>(true);
+  const [rejectTasking, setRejectTasking] = useState(false);
+  const [verifyingId, setVerifyingId] = useState<string | null>(null);
+
+  const [viewMode, setViewMode] = useState<'list' | 'grouped'>(
+    () => (typeof window !== 'undefined' ? localStorage.getItem('task_view') as 'list' | 'grouped' : null) || 'list'
+  );
+  const [dateFilter, setDateFilter] = useState<DateFilter>({ month: null, year: null, date_field: 'due_date' });
+  const [openTaskId, setOpenTaskId] = useState<string | null>(null);
+
+  const router = useRouter();
+
+  const setF = (k: string, v: string) => setForm(p => ({ ...p, [k]: v }));
+
+  const toggleView = (mode: 'list' | 'grouped') => {
+    setViewMode(mode);
+    localStorage.setItem('task_view', mode);
+  };
+
+  useEffect(() => {
+    const params = new URLSearchParams({ brand_id: brandId, limit: '200' });
+    if (dateFilter.month) params.set('month', String(dateFilter.month));
+    if (dateFilter.year) params.set('year', String(dateFilter.year));
+    if (dateFilter.date_field) params.set('date_field', dateFilter.date_field);
+
+    Promise.all([
+      api(`/api/agency/tasks?${params}`),
+      api(`/api/agency/brands/${brandId}/team`),
+      stratApi.list({ brand_id: brandId, status: 'active', limit: '10' }),
+      goalsApi.list({ brand_id: brandId, status: 'active', limit: '20' }),
+    ]).then(([tr, teamr, sr, gr]: any) => {
+      setTasks(tr.data ?? []);
+      setTeam((teamr.data?.team ?? []).map((m: any) => ({ ...m.users, roles_on_brand: m.roles_on_brand })));
+      setStrats(sr.data ?? []);
+      setGoals(gr.data ?? []);
+    }).catch(() => { }).finally(() => setLoading(false));
+  }, [brandId, dateFilter.month, dateFilter.year, dateFilter.date_field]);
+
+  function openEditModal(t: ITT) {
+    setEditingTask(t);
+    setEditForm({
+      title: t.title ?? '',
+      description: t.description ?? '',
+      status: t.status ?? 'todo',
+      priority: t.priority ?? 'medium',
+      due_date: t.due_date ?? '',
+      assignee_id: t.assignee_id ?? '',
+      strategy_id: t.strategy_id ?? '',
+      goal_id: t.goal_id ?? '',
+      actual_hours: t.actual_hours?.toString() ?? '',
+      estimated_hours: t.estimated_hours?.toString() ?? '',
+      tags: (t.tags ?? []).join(', '),
+      proof_links: (t.proof_links ?? []).join(', '),
+    });
+  }
+
+  async function saveEditedTask() {
+    if (!editingTask) return;
+    const taskId = editingTask.id;
+    setUpdateSaving(true);
+
+    const payload = {
+      title: editForm.title.trim(),
+      description: editForm.description.trim() || null,
+      status: editForm.status,
+      priority: editForm.priority,
+      due_date: editForm.due_date || null,
+      assignee_id: editForm.assignee_id || null,
+      strategy_id: editForm.strategy_id || null,
+      goal_id: editForm.goal_id || null,
+      actual_hours: editForm.actual_hours ? Number(editForm.actual_hours) : null,
+      estimated_hours: editForm.estimated_hours ? Number(editForm.estimated_hours) : null,
+      tags: editForm.tags ? editForm.tags.split(',').map(s => s.trim()).filter(Boolean) : [],
+      proof_links: editForm.proof_links ? editForm.proof_links.split(',').map(s => s.trim()).filter(Boolean) : [],
+    };
+
+    try {
+      const res: any = await api(`/api/agency/tasks/${taskId}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      });
+      setTasks(prev => prev.map(t => (t.id === taskId ? { ...t, ...res.data.task } : t)));
+      setEditingTask(null);
+    } catch (err: any) {
+      toast.error(err.message || 'Failed to update task');
+    } finally {
+      setUpdateSaving(false);
+    }
+  }
+
+  const createTask = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!form.title) { setError('Title is required'); return; }
+    setSaving(true); setError('');
+    try {
+      const res: any = await api('/api/agency/tasks', {
+        method: 'POST',
+        body: JSON.stringify({
+          brand_id: brandId,
+          title: form.title, description: form.description || null,
+          priority: form.priority, due_date: form.due_date || null,
+          assigned_to: form.assignee_id || null,
+          strategy_id: form.strategy_id || null,
+          goal_id: form.goal_id || null,
+          estimated_hours: form.estimated_hours ? parseFloat(form.estimated_hours) : null,
+        }),
+      });
+      setTasks(p => [res.data.task, ...p]);
+      setForm({ ...EMPTY_FORM }); setShowForm(false);
+    } catch (err: any) { setError(err.message || 'Failed to create task'); }
+    finally { setSaving(false); }
+  };
+
+  const updateStatus = async (taskId: string, newStatus: string) => {
+    try {
+      await api(`/api/agency/tasks/${taskId}/status`, { method: 'PUT', body: JSON.stringify({ status: newStatus }) });
+      setTasks(p => p.map(t => t.id === taskId ? { ...t, status: newStatus } : t));
+    } catch (err: any) { toast.error(err.message); }
+  };
+
+  const verifyTask = async (taskId: string) => {
+    setVerifyTasking(true);
+    try {
+      await api(`/api/agency/tasks/${taskId}/verify`, { method: 'PUT' });
+      setTasks(p => p.map(t => t.id === taskId ? { ...t, status: 'verified' } : t));
+      toast.success('Task verified');
+    } catch (err: any) { toast.error(err.message); } finally { setVerifyTasking(false); }
+  };
+
+  const rejectTask = async () => {
+    if (!rejectingId || !rejectReason.trim()) return;
+    setRejectTasking(true);
+    try {
+      await api(`/api/agency/tasks/${rejectingId}/reject-verification`, {
+        method: 'PUT', body: JSON.stringify({ reason: rejectReason.trim() }),
+      });
+      setTasks(p => p.map(t => t.id === rejectingId ? { ...t, status: 'in_progress' } : t));
+      toast.success('Task sent back for revision');
+      setRejectingId(null); setRejectReason('');
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setRejectTasking(false);
+    }
+  };
+
+  const generateFromStrategy = async (strategyId: string) => {
+    if (!confirm('Generate tasks from this strategy using ARIA? This will create multiple tasks assigned to the team.')) return;
+    setGeneratingTasks(true);
+    try {
+      const res: any = await api('/api/agency/tasks/bulk-create', {
+        method: 'POST',
+        body: JSON.stringify({ strategy_id: strategyId, brand_id: brandId }),
+      });
+      setTasks(p => [...(res.data.tasks ?? []), ...p]);
+      toast.success(`${res.data.count} tasks generated from strategy and assigned to the team!`);
+    } catch (err: any) { toast.error(err.message || 'Failed to generate tasks'); }
+    finally { setGeneratingTasks(false); }
+  };
+
+  const visibleTasks = filterAssignee ? tasks.filter(t => t.assignee_id === filterAssignee) : tasks;
+  const tasksByStatus = (status: string) => visibleTasks.filter(t => t.status === status);
+
+
+  const handleDeleteTask = async ({ taskId, openModal }: { taskId: string; openModal?: boolean }) => {
+    if (!confirm('Delete this task? This cannot be undone.')) return;
+
+    setDeletingId(taskId);
+    try {
+      const res = await api(`/api/agency/tasks/${taskId}`, { method: 'DELETE' });
+
+      if (res.data?.deleted) {
+        setTasks(prev => prev.filter(t => t.id !== taskId));
+      } else {
+        setTasks(prev => prev.map(t => (t.id === taskId ? { ...t, status: 'pending_deletion' } : t)));
+      }
+
+      toast.success(res.message || 'Task updated');
+
+      if (openModal) {
+        setEditingTask(null);
+      }
+    } catch (err: any) {
+      toast.error(err.message || 'Failed to delete task');
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+
+  useEffect(() => {
+    if (!perms.canManage && user?.id) {
+      setFA(user.id);
+    }
+  }, [perms.canManage, user?.id]);
+
+  if (loading) return <LoadingPage label="Loading tasks…" />;
+  if (importOpen) {
+    return (
+      <ImportTasksModal
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+      />
+    );
+  }
+
+
+  return (
+    <div className="p-4 sm:p-6 max-w-7xl mx-auto">
+      {perms.canAssignStaff && (
+        <AgencyTopNav title="Tasks" breadcrumb={[{ label: 'Brands', href: '/brands' }, { label: 'Brand', href: `/brands/${brandId}` }]} />)}
+      <button
+        type="button"
+        onClick={() => router.back()}
+        className="flex items-center gap-2 text-xs text-white/30 hover:text-white mb-5 transition-colors w-fit"
+      >
+        <ArrowLeft className="w-3.5 h-3.5" /> Back
+      </button>
+
+      {/* Header */}
+      <div className="flex items-start justify-between mb-6 flex-wrap gap-3">
+        <div>
+          <h1 className="text-xl font-bold text-white">Tasks</h1>
+          <p className="text-sm text-white/40 mt-0.5">{tasks.length} tasks · {tasksByStatus('in_progress').length} in progress</p>
+        </div>
+        <div className="flex items-center gap-2">
+          {/* Generate from strategy */}
+          {strategies.length > 0 && perms.canManage && (
+            <div className="relative group">
+              <button disabled={generatingTasks}
+                className="flex items-center gap-1.5 px-3 py-2 text-xs text-purple-400 border border-purple-500/20 rounded-xl hover:bg-purple-500/5 transition-all disabled:opacity-50">
+                {generatingTasks ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Lightbulb className="w-3.5 h-3.5" />}
+                Generate from Strategy
+              </button>
+              {/* Dropdown of strategies */}
+              <div className="absolute right-0 top-full mt-1 w-64 bg-[#12122a] border border-white/10 rounded-xl shadow-2xl z-20 hidden group-hover:block">
+                {strategies.map(s => (
+                  <button key={s.id} onClick={() => generateFromStrategy(s.id)}
+                    className="w-full flex items-center gap-2 px-3 py-2.5 text-xs text-left hover:bg-white/5 transition-all">
+                    <Lightbulb className="w-3.5 h-3.5 text-purple-400 flex-shrink-0" />
+                    <p className="text-white/70 truncate">{s.title}</p>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* View toggle */}
+          <div className="flex items-center gap-1 p-1 bg-white/3 rounded-xl border border-white/5">
+            <button onClick={() => setView('kanban')} className={`p-1.5 rounded-lg transition-all ${view === 'kanban' ? 'bg-purple-600 text-white' : 'text-white/40 hover:text-white'}`}><LayoutGrid className="w-4 h-4" /></button>
+            <button onClick={() => setView('list')} className={`p-1.5 rounded-lg transition-all ${view === 'list' ? 'bg-purple-600 text-white' : 'text-white/40 hover:text-white'}`}><List className="w-4 h-4" /></button>
+          </div>
+
+          <div className="flex items-center gap-2">
+
+            <button onClick={() => setImportOpen(true)} className="text-xs border p-2 rounded-lg flex items-center gap-2">
+              <Image
+                src="/excel.png"
+                width={20}
+                height={20}
+                alt="excel icon"
+              /> Upload tasks sheets
+            </button>
+
+            <button
+              onClick={() => {
+                setShowForm(true);
+                setError('');
+                setForm({ ...EMPTY_FORM });
+              }}
+              className="sabi-btn-primary flex items-center gap-2 px-4 py-2 text-sm"
+            >
+              <Plus className="w-4 h-4" /> New Task
+            </button>
+          </div>
+        </div>
+      </div >
+
+      {/* Filters */}
+      <div className="flex items-center gap-3 mb-5 flex-wrap" >
+        {perms.canManage ? (
+          <select
+            className="sabi-input w-44 text-sm"
+            value={filterAssignee}
+            onChange={e => setFA(e.target.value)}
+          >
+            <option className="bg-black" value="">All assignees</option>
+            {teamMembers.map(m => (
+              <option className="bg-black" key={m.id} value={m.id}>{m.full_name}</option>
+            ))}
+          </select>
+        ) : (
+          <div className="sabi-input w-44 text-sm flex items-center text-white/50">
+            {teamMembers.find(m => m.id === user?.id)?.full_name ?? user?.full_name ?? 'You'}
+          </div>
+        )}
+
+        <TaskDateFilter value={dateFilter} onChange={setDateFilter} />
+
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: '3px', background: 'rgba(255,255,255,0.03)', borderRadius: '7px', padding: '3px' }}>
+          {(['list', 'grouped'] as const).map(mode => (
+            <button key={mode} onClick={() => toggleView(mode)} style={{
+              padding: '5px 12px', borderRadius: '5px', cursor: 'pointer',
+              fontSize: '12px', fontWeight: 600, border: 'none',
+              background: viewMode === mode ? 'rgba(109,40,217,0.25)' : 'transparent',
+              color: viewMode === mode ? '#c4b5fd' : '#64748b',
+            }}>
+              {mode === 'list' ? '≡ List' : '⊞ Grouped'}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Create task modal */}
+      {
+        showForm && (
+          <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <div className="bg-[#12122a] border border-purple-500/20 rounded-2xl w-full max-w-lg max-h-[90vh] flex flex-col">
+              <div className="flex items-center justify-between p-6 border-b border-white/5">
+                <h2 className="text-base font-bold text-white">New Task</h2>
+                <button onClick={() => setShowForm(false)} className="text-white/30 hover:text-white transition-colors"><X className="w-5 h-5" /></button>
+              </div>
+              <div className="flex-1 overflow-y-auto p-6 space-y-4">
+                {error && <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-3 text-red-400 text-sm">{error}</div>}
+
+                <div>
+                  <label className="text-xs text-white/50 mb-1.5 block">Task Title *</label>
+                  <input className="sabi-input" required placeholder="e.g. Write 10 Instagram captions for Eid campaign"
+                    value={form.title} onChange={e => setF('title', e.target.value)} autoFocus />
+                </div>
+                <div>
+                  <label className="text-xs text-white/50 mb-1.5 block">Description</label>
+                  <textarea className="sabi-input resize-none" rows={3} placeholder="What needs to be done, and how…"
+                    value={form.description} onChange={e => setF('description', e.target.value)} />
+                </div>
+
+                {/* Assignee — key feature */}
+                <div>
+                  <label className="text-xs text-white/50 mb-1.5 block flex items-center gap-1.5">
+                    <User className="w-3.5 h-3.5" /> Assign to
+                  </label>
+                  <select className="sabi-input text-sm" value={form.assignee_id} onChange={e => setF('assignee_id', e.target.value)}>
+                    <option className='bg-black' value="">Unassigned</option>
+                    {teamMembers.map(m => <option className="bg-black" key={m.id} value={m.id}>{m.full_name} — {m.roles_on_brand?.[0]?.replace(/_/g, ' ') ?? m.role?.replace(/_/g, ' ')}</option>)}
+                  </select>
+                  {form.assignee_id && <p className="text-xs text-green-400/70 mt-1.5">✓ They will be notified when you save this task</p>}
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs text-white/50 mb-1.5 block">Priority</label>
+                    <div className="space-y-1.5">
+                      {Object.entries(PRIORITY_META).map(([v, m]) => (
+                        <button type="button" key={v} onClick={() => setF('priority', v)}
+                          className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg border text-xs transition-all ${form.priority === v ? `${m.color} border-current bg-current/10` : 'border-white/5 text-white/40 hover:border-white/10'}`}>
+                          <div className={`w-2 h-2 rounded-full flex-shrink-0 ${m.dot}`} />
+                          {m.label}
+                          {form.priority === v && <Check className="w-3 h-3 ml-auto" />}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    <div>
+                      <label className="text-xs text-white/50 mb-1.5 block">Due Date</label>
+                      <input type="date" className="sabi-input text-sm" value={form.due_date} onChange={e => setF('due_date', e.target.value)} />
+                    </div>
+                    <div>
+                      <label className="text-xs text-white/50 mb-1.5 block">Est. Hours</label>
+                      <input type="number" min="0" step="0.5" className="sabi-input text-sm" placeholder="e.g. 3"
+                        value={form.estimated_hours} onChange={e => setF('estimated_hours', e.target.value)} />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs text-white/50 mb-1.5 block">Strategy</label>
+                    <select className="sabi-input text-sm" value={form.strategy_id} onChange={e => setF('strategy_id', e.target.value)}>
+                      <option className="bg-black" value="">No strategy</option>
+                      {strategies.map(s => <option className="bg-black" key={s.id} value={s.id}>{s.title}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-white/50 mb-1.5 block">Goal</label>
+                    <select className="sabi-input text-sm" value={form.goal_id} onChange={e => setF('goal_id', e.target.value)}>
+                      <option className="bg-black" value="">No goal</option>
+                      {goals.map(g => <option className="bg-black" key={g.id} value={g.id}>{g.title}</option>)}
+                    </select>
+                  </div>
+                </div>
+              </div>
+              <div className="flex gap-3 p-6 border-t border-white/5">
+                <button onClick={createTask} disabled={saving || !form.title}
+                  className="sabi-btn-primary flex-1 flex items-center justify-center gap-2 py-2.5 text-sm disabled:opacity-50">
+                  {saving ? <><Loader2 className="w-4 h-4 animate-spin" />Creating…</> : <><Check className="w-4 h-4" />Create Task</>}
+                </button>
+                <button onClick={() => setShowForm(false)} className="px-4 text-sm text-white/40 hover:text-white transition-colors">Cancel</button>
+              </div>
+            </div>
+          </div>
+        )
+      }
+
+      {viewMode === 'grouped' ? (
+        <TaskGroupedView
+          brandId={brandId}
+          userRole={user?.role ?? ''}
+          filters={{
+            month: dateFilter.month,
+            year: dateFilter.year,
+            date_field: dateFilter.date_field,
+            status: undefined,
+          }}
+          onOpenTask={id => setOpenTaskId(id)}
+        />
+      ) : (
+        <>
+      {/* ── KANBAN VIEW ────────────────────────────────────────── */}
+      {
+        view === 'kanban' && (
+          <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
+            {COLUMNS.map(col => {
+              const colTasks = tasksByStatus(col.key);
+              return (
+                <div key={col.key} className={`rounded-2xl border p-4 min-h-48 ${col.color}`}>
+                  <div className="flex items-center gap-2 mb-4">
+                    <div className={`w-2 h-2 rounded-full flex-shrink-0 ${col.dot}`} />
+                    <p className="text-xs font-semibold text-white">{col.label}</p>
+                    <span className="text-xs text-white/30 ml-auto">{colTasks.length}</span>
+                  </div>
+                  <div className="space-y-2">
+                    {colTasks.map(t => {
+                      const pri = PRIORITY_META[t.priority ?? 'medium'];
+                      const assignee = teamMembers.find(m => m.id === t.assignee_id);
+                      return (
+                        <div key={t.id} className="bg-[#12122a] border border-white/6 rounded-xl p-3 cursor-pointer hover:border-white/15 transition-all group">
+                          <div className="flex items-start justify-between gap-2 mb-2">
+                            <p className="text-xs font-medium text-white leading-snug">{t.title}</p>
+
+                            <div className="relative w-4 h-4 flex-shrink-0 mt-1">
+                              <div
+                                className={`absolute inset-0 flex items-center justify-center transition-opacity opacity-100 group-hover:opacity-0 ${perms.canManage ? '' : 'opacity-100 group-hover:opacity-100'}`}
+                              >
+                                <div className={`w-2 h-2 rounded-full ${pri.dot}`} title={pri.label} />
+                              </div>
+
+                              {perms.canManage && (
+                                <button
+                                  onClick={() => openEditModal(t)}
+                                  className="absolute inset-0 flex items-center justify-center rounded-md text-white/30 hover:text-white hover:bg-white/10 transition-opacity opacity-0 group-hover:opacity-100"
+                                  aria-label="Edit task"
+                                >
+                                  <Pencil className="w-3 h-3" />
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2 flex-wrap">
+                            {t.due_date && (
+                              <span className="text-[10px] text-white/30 flex items-center gap-0.5">
+                                <Clock className="w-2.5 h-2.5" />{t.due_date}
+                              </span>
+                            )}
+                            {t.strategies && (
+                              <span className="text-[10px] text-purple-400/60 flex items-center gap-0.5 truncate max-w-[80px]">
+                                <Lightbulb className="w-2.5 h-2.5 flex-shrink-0" />{t.strategies.title}
+                              </span>
+                            )}
+                          </div>
+                          {assignee && (
+                            <div className="flex items-center gap-1.5 mt-2">
+                              <div className="w-5 h-5 rounded-full bg-purple-500/30 flex items-center justify-center text-[10px] font-bold text-purple-300">
+                                {assignee.full_name?.[0]}
+                              </div>
+                              <span className="text-[10px] text-white/40 truncate">{assignee.full_name}</span>
+                            </div>
+                          )}
+                          {t.status === 'done' && perms.canManage && (
+                            <div className="flex gap-1.5 mt-2">
+                              <button
+                                onClick={async () => {
+                                  setVerifyingId(t.id);
+                                  try {
+                                    await verifyTask(t.id);
+                                  } finally {
+                                    setVerifyingId(null);
+                                  }
+                                }}
+                                disabled={verifyingId === t.id}
+                                className="flex-1 flex items-center justify-center gap-1.5 text-[10px] py-1.5 rounded-lg bg-green-500/10 border border-green-500/25 text-green-400 hover:bg-green-500/20 transition-all font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                              >
+                                {verifyingId === t.id ? (
+                                  <LoaderCircle className="w-3 h-3 animate-spin" />
+                                ) : (
+                                  <Check className="w-3 h-3" />
+                                )}
+                                Verify
+                              </button>
+
+                              <button
+                                onClick={() => { setRejectingId(t.id); setRejectReason(''); }}
+                                disabled={verifyingId === t.id}
+                                className="flex-1 flex items-center justify-center gap-1.5 text-[10px] py-1.5 rounded-lg bg-red-500/10 border border-red-500/25 text-red-400 hover:bg-red-500/20 transition-all font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                              >
+                                <X className="w-3 h-3" /> Reject
+                              </button>
+                            </div>
+                          )}
+                          {/* Status change — only admin/brand admin can move task out of Verified */}
+                          {((t.status !== 'pending_deletion' && t.status !== 'verified') || perms.canManage) && (
+                            <select className="w-full mt-2 text-[10px] bg-black border border-white/8 rounded-lg px-2 py-1 text-white/50 hover:text-white cursor-pointer transition-all opacity-0 group-hover:opacity-100"
+                              value={t.status} onChange={e => updateStatus(t.id, e.target.value)}>
+                              {COLUMNS.filter(c => c.key !== 'verified').map(c => <option className='bg-black' key={c.key} value={c.key}>{c.label}</option>)}
+                            </select>
+                          )}
+                          {t.status !== 'pending_deletion' && (
+                            <button
+                              onClick={() => handleDeleteTask({ taskId: t.id })}
+                              disabled={deletingId === t.id}
+                              className="flex items-center ml-auto justify-end mt-2 disabled:opacity-50"
+                            >
+                              {deletingId === t.id ? (
+                                <LoaderCircle className="animate-spin" size={10} />
+                              ) : (
+                                <Trash2 className="text-red-800" size={10} />
+                              )}
+                            </button>)}
+                        </div>
+                      );
+                    })}
+                    {colTasks.length === 0 && (
+                      <div className="text-center py-6 text-white/15 text-xs">No tasks here</div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )
+      }
+
+      {/* ── LIST VIEW ──────────────────────────────────────────── */}
+      {
+        view === 'list' && (
+          tasks.length === 0 ? (
+            <EmptyState icon={AlertCircle} title="No tasks yet"
+              description="Create tasks, assign them to staff, and track progress."
+              action={{ label: 'Create First Task', onClick: () => setShowForm(true) }} />
+          ) : (
+            <div className="sabi-card overflow-hidden">
+              <table className="w-full">
+                <thead>
+                  <tr className="border-b border-white/5">
+                    {['Task', 'Assignee', 'Priority', 'Strategy', 'Due', 'Status',].map(h => (
+                      <th key={h} className="px-4 py-3 text-left text-xs text-white/30 font-medium uppercase tracking-wider first:pl-5 last:pr-5">{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleTasks.map((t, i) => {
+                    const pri = PRIORITY_META[t.priority ?? 'medium'];
+                    const assignee = teamMembers.find(m => m.id === t.assignee_id);
+                    const statusCol = { todo: 'gray', in_progress: 'blue', in_review: 'amber', done: 'green', blocked: 'red' } as const;// your existing/new state
+                    // statusCol[t.status]
+                    return (
+                      <tr key={t.id} className={`border-b border-white/3 hover:bg-white/2 transition-all ${i % 2 === 0 ? '' : 'bg-white/1'}`}>
+                        <td className="px-4 py-3 pl-5">
+                          <p className="text-sm text-white font-medium">{t.title}</p>
+                          {t.strategies && <p className="text-xs text-purple-400/60 mt-0.5 flex items-center gap-1"><Lightbulb className="w-3 h-3" />{t.strategies.title}</p>}
+                        </td>
+                        <td className="px-4 py-3">
+                          {assignee ? (
+                            <div className="flex items-center gap-1.5">
+                              <div className="w-6 h-6 rounded-full bg-purple-500/25 flex items-center justify-center text-[10px] font-bold text-purple-300 flex-shrink-0">{assignee.full_name?.[0]}</div>
+                              <span className="text-xs text-white/60">{assignee.full_name}</span>
+                            </div>
+                          ) : <span className="text-xs text-white/20">Unassigned</span>}
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className={`text-xs font-medium flex items-center gap-1 ${pri.color}`}>
+                            <div className={`w-1.5 h-1.5 rounded-full ${pri.dot}`} />{pri.label}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-xs text-white/40 max-w-[120px] truncate">{t.strategies?.title ?? '—'}</td>
+                        <td className="px-4 py-3 text-xs text-white/35">{t.due_date ?? '—'}</td>
+                        {t.status === 'verified' && (<td className="px-4 py-3 font capitalize text-xs text-green-400 hover:text-green-300 transition-colors">{t.status}</td>)}
+                        <td className="px-4 py-3 pr-5">
+                          {t.status === 'done' && perms.canManage ? (
+                            <div className="flex items-center gap-2">
+                              <button onClick={() => verifyTask(t.id)}
+                                className="text-xs text-green-400 hover:text-green-300 transition-colors flex items-center gap-1">
+                                <Check className="w-3 h-3" /> Verify
+                              </button>
+                              <button onClick={() => { setRejectingId(t.id); setRejectReason(''); }}
+                                className="text-xs text-red-400 hover:text-red-300 transition-colors flex items-center gap-1">
+                                <X className="w-3 h-3" /> Reject
+                              </button>
+                            </div>
+                          ) : (t.status !== 'verified' || perms.canManage) ? (
+                            <select className="text-xs bg-white/5 border border-white/10 rounded-lg px-2 py-1 text-white/50 hover:text-white cursor-pointer transition-all"
+                              value={t.status} onChange={e => updateStatus(t.id, e.target.value)}>
+                              {COLUMNS.filter(c => c.key !== 'verified').map(c => <option key={c.key} className='bg-black ' value={c.key}>{c.label}</option>)}
+                            </select>
+                          ) : null}
+                        </td>
+                        {perms.canManage && (
+                          <td className="px-4 py-3">
+                            <button
+                              onClick={() => openEditModal(t)}
+                              className="p-1 rounded-md text-white/30 hover:text-white hover:bg-white/10 transition-all"
+                              aria-label="Edit task"
+                            >
+                              <Pencil className="w-3 h-3" />
+                            </button>
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )
+        )
+      }
+      </>
+      )}
+      {/* ── REJECT MODAL ───────────────────────────────────────── */}
+      {
+        rejectingId && (
+          <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <div className="bg-[#12122a] border border-red-500/20 rounded-2xl w-full max-w-md p-6">
+              <h3 className="text-base font-bold text-white mb-2">Send Back for Revision</h3>
+              <p className="text-xs text-white/40 mb-4">Explain what needs to be fixed. The assignee will be notified.</p>
+              <textarea className="sabi-input resize-none text-sm" rows={3} placeholder="e.g. Missing deliverables, doesn't meet brief requirements..."
+                value={rejectReason} onChange={e => setRejectReason(e.target.value)} />
+              <div className="flex gap-2 mt-4">
+                <button
+                  onClick={rejectTask}
+                  disabled={!rejectReason.trim() || rejectTasking}
+                  className="flex-1 py-2 text-sm rounded-lg bg-red-500/15 border border-red-500/30 text-red-400 font-medium hover:bg-red-500/25 transition-all disabled:opacity-40"
+                >
+                  {rejectTasking ? 'Sending...' : 'Send Back'}
+                </button>
+                <button onClick={() => { setRejectingId(null); setRejectReason(''); }}
+                  className="px-4 py-2 text-sm text-white/40 hover:text-white transition-colors">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        )
+      }
+      {editingTask && (
+        <div
+          className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
+          onClick={() => setEditingTask(null)}
+        >
+          <div
+            className="bg-[#0f0f13] border border-white/10 rounded-xl w-full max-w-lg max-h-[85vh] overflow-y-auto"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
+              <h2 className="text-sm font-semibold text-white">Edit Task</h2>
+              <button onClick={() => setEditingTask(null)} className="text-white/40 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              <div>
+                <label className="text-xs text-white/50 mb-1 block">Title</label>
+                <input
+                  value={editForm.title}
+                  onChange={e => setEditForm(f => ({ ...f, title: e.target.value }))}
+                  className="w-full text-sm bg-white/5 border border-white/10 rounded-md px-3 py-2 text-white focus:outline-none focus:border-purple-400/40"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs text-white/50 mb-1 block">Description</label>
+                <textarea
+                  value={editForm.description}
+                  onChange={e => setEditForm(f => ({ ...f, description: e.target.value }))}
+                  rows={3}
+                  className="w-full text-sm bg-white/5 border border-white/10 rounded-md px-3 py-2 text-white focus:outline-none focus:border-purple-400/40 resize-none"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-white/50 mb-1 block">Status</label>
+                  <select
+                    value={editForm.status}
+                    onChange={e => setEditForm(f => ({ ...f, status: e.target.value }))}
+                    className="w-full text-sm bg-white/5 border border-white/10 rounded-md px-3 py-2 text-white"
+                  >
+                    {COLUMNS.map(c => (
+                      <option key={c.key} value={c.key} className="bg-black">{c.label}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="text-xs text-white/50 mb-1 block">Priority</label>
+                  <select
+                    value={editForm.priority}
+                    onChange={e => setEditForm(f => ({ ...f, priority: e.target.value }))}
+                    className="w-full text-sm bg-white/5 border border-white/10 rounded-md px-3 py-2 text-white"
+                  >
+                    {Object.entries(PRIORITY_META).map(([key, meta]) => (
+                      <option key={key} value={key} className="bg-black">{meta.label}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-white/50 mb-1 block">Due Date</label>
+                  <input
+                    type="date"
+                    value={editForm.due_date}
+                    onChange={e => setEditForm(f => ({ ...f, due_date: e.target.value }))}
+                    className="w-full text-sm bg-white/5 border border-white/10 rounded-md px-3 py-2 text-white"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-xs text-white/50 mb-1 block">Assignee</label>
+                  <select
+                    value={editForm.assignee_id}
+                    onChange={e => setEditForm(f => ({ ...f, assignee_id: e.target.value }))}
+                    className="w-full text-sm bg-white/5 border border-white/10 rounded-md px-3 py-2 text-white"
+                  >
+                    <option value="" className="bg-black">Unassigned</option>
+                    {teamMembers.map(m => (
+                      <option key={m.id} value={m.id} className="bg-black">{m.full_name}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-white/50 mb-1 block">Strategy</label>
+                  <select
+                    value={editForm.strategy_id}
+                    onChange={e => setEditForm(f => ({ ...f, strategy_id: e.target.value }))}
+                    className="w-full text-sm bg-white/5 border border-white/10 rounded-md px-3 py-2 text-white"
+                  >
+                    <option value="" className="bg-black">None</option>
+                    {strategies.map(s => (
+                      <option key={s.id} value={s.id} className="bg-black">{s.title}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="text-xs text-white/50 mb-1 block">Goal</label>
+                  <select
+                    value={editForm.goal_id}
+                    onChange={e => setEditForm(f => ({ ...f, goal_id: e.target.value }))}
+                    className="w-full text-sm bg-white/5 border border-white/10 rounded-md px-3 py-2 text-white"
+                  >
+                    <option value="" className="bg-black">None</option>
+                    {goals.map(g => (
+                      <option key={g.id} value={g.id} className="bg-black">{g.title}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-white/50 mb-1 block">Estimated Hours</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.5"
+                    value={editForm.estimated_hours}
+                    onChange={e => setEditForm(f => ({ ...f, estimated_hours: e.target.value }))}
+                    className="w-full text-sm bg-white/5 border border-white/10 rounded-md px-3 py-2 text-white"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-xs text-white/50 mb-1 block">Actual Hours</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.5"
+                    value={editForm.actual_hours}
+                    onChange={e => setEditForm(f => ({ ...f, actual_hours: e.target.value }))}
+                    className="w-full text-sm bg-white/5 border border-white/10 rounded-md px-3 py-2 text-white"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-xs text-white/50 mb-1 block">Tags (comma separated)</label>
+                <input
+                  value={editForm.tags}
+                  onChange={e => setEditForm(f => ({ ...f, tags: e.target.value }))}
+                  placeholder="urgent, client-facing"
+                  className="w-full text-sm bg-white/5 border border-white/10 rounded-md px-3 py-2 text-white"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs text-white/50 mb-1 block">Proof Links (comma separated)</label>
+                <input
+                  value={editForm.proof_links}
+                  onChange={e => setEditForm(f => ({ ...f, proof_links: e.target.value }))}
+                  placeholder="https://..."
+                  className="w-full text-sm bg-white/5 border border-white/10 rounded-md px-3 py-2 text-white"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between gap-2 px-5 py-4 border-t border-white/10">
+              <button
+                onClick={() => handleDeleteTask({ taskId: editingTask.id, openModal: true })}
+                disabled={deletingId === editingTask.id}
+                className="flex items-center justify-end mt-2 disabled:opacity-50"
+              >
+                {deletingId === editingTask.id ? (
+                  <LoaderCircle className="animate-spin" />
+                ) : (
+                  <Trash2 className="text-red-800" />
+                )}
+              </button>
+              <div className='flex items-center gap-2'>
+                <button
+                  onClick={() => setEditingTask(null)}
+                  className="text-xs text-white/50 hover:text-white px-3 py-2 rounded-md transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={saveEditedTask}
+                  disabled={deletingId === editingTask.id || updateSaving || !editForm.title.trim()}
+                  className="text-xs bg-purple-500/80 hover:bg-purple-500 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-2 rounded-md transition-colors flex items-center gap-1.5"
+                >
+                  {updateSaving ? 'Saving...' : 'Save Changes'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── TASK DETAIL SLIDE-OVER ─────────────────────────────── */}
+      {openTaskId && (() => {
+        const t = tasks.find(x => x.id === openTaskId);
+        if (!t) return null;
+        const assignee = teamMembers.find(m => m.id === t.assignee_id);
+        const pri = PRIORITY_META[t.priority ?? 'medium'];
+        return (
+          <div className="fixed inset-0 bg-black/60 z-50" onClick={() => setOpenTaskId(null)}>
+            <div
+              className="absolute right-0 top-0 h-full w-full max-w-2xl bg-[#0f0f13] border-l border-white/10 flex flex-col"
+              onClick={e => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
+                <div className="flex items-center gap-2">
+                  <div className={`w-2 h-2 rounded-full flex-shrink-0 ${pri.dot}`} />
+                  <h2 className="text-sm font-semibold text-white">{t.title}</h2>
+                </div>
+                <div className="flex items-center gap-2">
+                  {perms.canManage && (
+                    <button
+                      onClick={() => { openEditModal(t); setOpenTaskId(null); }}
+                      className="text-xs text-white/50 hover:text-white px-3 py-1.5 rounded-md hover:bg-white/5 transition-all"
+                    >
+                      Edit
+                    </button>
+                  )}
+                  <button onClick={() => setOpenTaskId(null)} className="text-white/40 hover:text-white"><X className="w-4 h-4" /></button>
+                </div>
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-5 space-y-4">
+                <div className="flex items-center gap-2 flex-wrap text-xs">
+                  <span className={`px-2 py-1 rounded-md font-medium ${pri.color}`}>{pri.label} priority</span>
+                  <span className="px-2 py-1 bg-white/5 rounded-md text-white/50 capitalize">{t.status?.replace(/_/g, ' ')}</span>
+                  {t.due_date && (
+                    <span className="px-2 py-1 bg-white/5 rounded-md text-white/50 flex items-center gap-1">
+                      <Clock className="w-3 h-3" />{new Date(t.due_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+                    </span>
+                  )}
+                  {assignee && (
+                    <span className="px-2 py-1 bg-purple-500/10 border border-purple-500/20 rounded-md text-purple-300 flex items-center gap-1.5">
+                      <div className="w-4 h-4 rounded-full bg-purple-500/30 flex items-center justify-center text-[9px] font-bold text-purple-300">{assignee.full_name?.[0]}</div>
+                      {assignee.full_name}
+                    </span>
+                  )}
+                </div>
+
+                {t.description ? (
+                  <p className="text-sm text-white/70 leading-relaxed whitespace-pre-wrap">{t.description}</p>
+                ) : (
+                  <p className="text-xs text-white/25">No description.</p>
+                )}
+
+                <TaskCommentThread
+                  taskId={openTaskId}
+                  brandId={brandId}
+                  currentUser={{ id: user?.id ?? '', name: user?.full_name ?? '', role: user?.role ?? '' }}
+                />
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+    </div>
+  );
+}
